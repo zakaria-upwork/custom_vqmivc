@@ -1,148 +1,163 @@
-import argparse
-import json
+# Prediction interface for Cog ⚙️
+# https://github.com/replicate/cog/blob/main/docs/python.md
+
+from TTS.api import TTS
+
+import io
 import os
-import subprocess
-import tempfile
-import zipfile
-
-from cog import BasePredictor, Input, Path
-import kaldiio
-import numpy as np
-import pyworld as pw
-import resampy
-import soundfile as sf
+from typing import Optional, Any
 import torch
+import numpy as np
+import cProfile
+import pstats
+from pstats import SortKey
+import time
 
-from model_decoder import Decoder_ac
-from model_encoder import Encoder, Encoder_lf0
-from model_encoder import SpeakerEncoder as Encoder_spk
-from spectrogram import logmelspectrogram
+from cog import BasePredictor, Input, Path, BaseModel
 
+import whisper
+from whisper.model import Whisper, ModelDimensions
+from whisper.tokenizer import LANGUAGES, TO_LANGUAGE_CODE
+from whisper.utils import format_timestamp
 
-def extract_logmel(wav_path, mean, std, sr=16000):
-    # wav, fs = librosa.load(wav_path, sr=sr)
-    wav, fs = sf.read(wav_path)
-    if fs != sr:
-        wav = resampy.resample(wav, fs, sr, axis=0)
-        fs = sr
-    # wav, _ = librosa.effects.trim(wav, top_db=15)
-    # duration = len(wav)/fs
-    assert fs == 16000
-    peak = np.abs(wav).max()
-    if peak > 1.0:
-        wav /= peak
-    mel = logmelspectrogram(
-        x=wav,
-        fs=fs,
-        n_mels=80,
-        n_fft=400,
-        n_shift=160,
-        win_length=400,
-        window="hann",
-        fmin=80,
-        fmax=7600,
-    )
-    mel = (mel - mean) / (std + 1e-8)
-    tlen = mel.shape[0]
-    frame_period = 160 / fs * 1000
-    f0, timeaxis = pw.dio(wav.astype("float64"), fs, frame_period=frame_period)
-    f0 = pw.stonemask(wav.astype("float64"), f0, timeaxis, fs)
-    f0 = f0[:tlen].reshape(-1).astype("float32")
-    nonzeros_indices = np.nonzero(f0)
-    lf0 = f0.copy()
-    lf0[nonzeros_indices] = np.log(
-        f0[nonzeros_indices]
-    )  # for f0(Hz), lf0 > 0 when f0 != 0
-    mean, std = np.mean(lf0[nonzeros_indices]), np.std(lf0[nonzeros_indices])
-    lf0[nonzeros_indices] = (lf0[nonzeros_indices] - mean) / (std + 1e-8)
-    return mel, lf0
 
 
 class Predictor(BasePredictor):
-    def setup(self):
-        """Load models"""
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint_path = "VQMIVC-pretrained models/checkpoints/useCSMITrue_useCPMITrue_usePSMITrue_useAmpTrue/VQMIVC-model.ckpt-500.pt"
-        mel_stats = np.load("./mel_stats/stats.npy")
+    def setup(self) -> None:
 
-        encoder = Encoder(
-            in_channels=80, channels=512, n_embeddings=512, z_dim=64, c_dim=256
-        )
-        encoder_lf0 = Encoder_lf0()
-        encoder_spk = Encoder_spk()
-        decoder = Decoder_ac(dim_neck=64)
-        encoder.to(device)
-        encoder_lf0.to(device)
-        encoder_spk.to(device)
-        decoder.to(device)
+        self.model = TTS("tts_models/multilingual/multi-dataset/xtts_v1", gpu=True)
 
-        checkpoint = torch.load(
-            checkpoint_path, map_location=lambda storage, loc: storage
-        )
-        encoder.load_state_dict(checkpoint["encoder"])
-        encoder_spk.load_state_dict(checkpoint["encoder_spk"])
-        decoder.load_state_dict(checkpoint["decoder"])
-
-        encoder.eval()
-        encoder_spk.eval()
-        decoder.eval()
-
-        self.mean = mel_stats[0]
-        self.std = mel_stats[1]
-        self.encoder = encoder
-        self.encoder_spk = encoder_spk
-        self.encoder_lf0 = encoder_lf0
-        self.decoder = decoder
-        self.device = device
+        with open(f"./weights/large-v2.pt", "rb") as fp:
+            checkpoint = torch.load(fp, map_location="cpu")
+            dims = ModelDimensions(**checkpoint["dims"])
+            self.text_model = Whisper(dims)
+            self.text_model.load_state_dict(checkpoint["model_state_dict"])
+            self.text_model.to("cuda")
 
     def predict(
         self,
-        input_source: Path = Input(description="Source voice wav path"),
-        input_reference: Path = Input(description="Reference voice wav path"),
+        text: str = Input(description="Text to synthesize"),
+        language: str = Input(description="Languaage"),
+        speaker_wav: Path = Input(description="Original speaker audio"),
+        audio: Path = Input(description="Audio file"),
+        model: str = Input(
+            default="large-v2",
+            choices=["large", "large-v2"],
+            description="Choose a Whisper model.",
+        ),
+        transcription: str = Input(
+            choices=["plain text", "srt", "vtt"],
+            default="plain text",
+            description="Choose the format for the transcription",
+        ),
+        translate: bool = Input(
+            default=False,
+            description="Translate the text to English when set to True",
+        ),
+        text_language: str = Input(
+            choices=sorted(LANGUAGES.keys())
+            + sorted([k.title() for k in TO_LANGUAGE_CODE.keys()]),
+            default=None,
+            description="language spoken in the audio, specify None to perform language detection",
+        ),
+        temperature: float = Input(
+            default=0,
+            description="temperature to use for sampling",
+        ),
+        patience: float = Input(
+            default=None,
+            description="optional patience value to use in beam decoding, as in https://arxiv.org/abs/2204.05424, the default (1.0) is equivalent to conventional beam search",
+        ),
+        suppress_tokens: str = Input(
+            default="-1",
+            description="comma-separated list of token ids to suppress during sampling; '-1' will suppress most special characters except common punctuations",
+        ),
+        initial_prompt: str = Input(
+            default=None,
+            description="optional text to provide as a prompt for the first window.",
+        ),
+        condition_on_previous_text: bool = Input(
+            default=True,
+            description="if True, provide the previous output of the model as a prompt for the next window; disabling may make the text inconsistent across windows, but the model becomes less prone to getting stuck in a failure loop",
+        ),
+        temperature_increment_on_fallback: float = Input(
+            default=0.2,
+            description="temperature to increase when falling back when the decoding fails to meet either of the thresholds below",
+        ),
+        compression_ratio_threshold: float = Input(
+            default=2.4,
+            description="if the gzip compression ratio is higher than this value, treat the decoding as failed",
+        ),
+        logprob_threshold: float = Input(
+            default=-1.0,
+            description="if the average log probability is lower than this value, treat the decoding as failed",
+        ),
+        no_speech_threshold: float = Input(
+            default=0.6,
+            description="if the probability of the <|nospeech|> token is higher than this value AND the decoding has failed due to `logprob_threshold`, consider the segment as silence",
+        ) 
     ) -> Path:
-        """Compute prediction"""
-        # inference
-        out_dir = Path(tempfile.mkdtemp())
-        out_path = out_dir / Path(
-            os.path.basename(str(input_source)).split(".")[0] + "_converted_gen.wav"
-        )
-        src_wav_path = input_source
-        ref_wav_path = input_reference
-        feat_writer = kaldiio.WriteHelper(
-            "ark,scp:{o}.ark,{o}.scp".format(o=str(out_dir) + "/feats.1")
-        )
-        src_mel, src_lf0 = extract_logmel(src_wav_path, self.mean, self.std)
-        ref_mel, _ = extract_logmel(ref_wav_path, self.mean, self.std)
+        """Transcribes and optionally translates a single audio file"""
+        print(f"Transcribe with {model} model")
+        text_model = self.text_model
+        if temperature_increment_on_fallback is not None:
+            temperature = tuple(
+                np.arange(temperature, 1.0 + 1e-6, temperature_increment_on_fallback)
+            )
+        else:
+            temperature = [temperature]
 
-        src_mel = torch.FloatTensor(src_mel.T).unsqueeze(0).to(self.device)
-        src_lf0 = torch.FloatTensor(src_lf0).unsqueeze(0).to(self.device)
-        ref_mel = torch.FloatTensor(ref_mel.T).unsqueeze(0).to(self.device)
-        out_filename = os.path.basename(src_wav_path).split(".")[0]
+        args = {
+            "language": text_language,
+            "patience": patience,
+            "suppress_tokens": suppress_tokens,
+            "initial_prompt": initial_prompt,
+            "condition_on_previous_text": condition_on_previous_text,
+            "compression_ratio_threshold": compression_ratio_threshold,
+            "logprob_threshold": logprob_threshold,
+            "no_speech_threshold": no_speech_threshold,
+            "fp16": True,
+            "verbose": False
+        }
+        with torch.inference_mode():
+            result = text_model.transcribe(str(audio), temperature=temperature, **args)
 
-        with torch.no_grad():
-            z, _, _, _ = self.encoder.encode(src_mel)
-            lf0_embs = self.encoder_lf0(src_lf0)
-            spk_emb = self.encoder_spk(ref_mel)
-            output = self.decoder(z, lf0_embs, spk_emb)
+        if transcription == "plain text":
+            transcription = result["text"]
+        elif transcription == "srt":
+            transcription = write_srt(result["segments"])
+        else:
+            transcription = write_vtt(result["segments"])
 
-            feat_writer[out_filename + "_converted"] = output.squeeze(0).cpu().numpy()
-            feat_writer[out_filename + "_source"] = src_mel.squeeze(0).cpu().numpy().T
-            feat_writer[out_filename + "_reference"] = (
-                ref_mel.squeeze(0).cpu().numpy().T
+        if translate:
+            translation = text_model.transcribe(
+                str(audio), task="translate", temperature=temperature, **args
             )
 
-        feat_writer.close()
+        path = self.model.tts_to_file(text=transcription, 
+        file_path = "output.wav",
+        speaker_wav = speaker_wav,
+        language= language
+        )
 
-        print("synthesize waveform...")
-        cmd = [
-            "parallel-wavegan-decode",
-            "--checkpoint",
-            "./vocoder/checkpoint-3000000steps.pkl",
-            "--feats-scp",
-            f"{str(out_dir)}/feats.1.scp",
-            "--outdir",
-            str(out_dir),
-        ]
-        subprocess.call(cmd)
+        return Path(path)
 
-        return out_path
+
+def write_vtt(transcript):
+    result = ""
+    for segment in transcript:
+        result += f"{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}\n"
+        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += "\n"
+    return result
+
+
+def write_srt(transcript):
+    result = ""
+    for i, segment in enumerate(transcript, start=1):
+        result += f"{i}\n"
+        result += f"{format_timestamp(segment['start'], always_include_hours=True, decimal_marker=',')} --> "
+        result += f"{format_timestamp(segment['end'], always_include_hours=True, decimal_marker=',')}\n"
+        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += "\n"
+    return result
